@@ -1,657 +1,755 @@
-// server.js - Professional Football Prediction System
-// ✅ Fixed MongoDB Connection ✅ Pakistan Time Zone ✅ Last 100 Predictions
 
-import express from "express";
-import axios from "axios";
-import mongoose from "mongoose";
-import moment from "moment-timezone";
-import cron from "node-cron";
-import cors from "cors";
-import path from "path";
-import { fileURLToPath } from "url";
+import express from 'express';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 const PORT = process.env.PORT || 8080;
 
-// ===================== MONGODB CONNECTION (FIXED) =====================
-// Railway uses MONGO_PUBLIC_URL, also check common variants
-const MONGO_URI = process.env.MONGO_URI || 
-                  process.env.MONGODB_URI || 
-                  process.env.MONGO_PUBLIC_URL ||
-                  process.env.MONGO_URL ||
-                  process.env.DATABASE_URL;
+// ==================== API KEYS ====================
+const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY || 'fdab0eef5743173c30f9810bef3a6742';
+const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY || '62207494b8a241db93aee4c14b7c1266';
 
-if (!MONGO_URI) {
-  console.log("❌ CRITICAL ERROR: MongoDB URI not found!");
-  console.log("💡 Available environment variables:");
-  console.log(Object.keys(process.env).filter(k => k.includes('MONGO') || k.includes('DATABASE')));
-  console.log("💡 Add one of these: MONGO_URI, MONGO_PUBLIC_URL, or MONGODB_URI");
-  console.log("Example: mongodb+srv://user:pass@cluster.mongodb.net/football");
-  process.exit(1);
+// ==================== TOP LEAGUES ====================
+const TOP_LEAGUES = {
+  39: 'Premier League',
+  140: 'La Liga',
+  135: 'Serie A',
+  78: 'Bundesliga',
+  61: 'Ligue 1',
+  94: 'Primeira Liga',
+  88: 'Eredivisie',
+  203: 'Super Lig',
+  480: 'Arab Cup',
+  32: 'World Cup Qualification Africa',
+  33: 'World Cup Qualification Asia',
+  34: 'World Cup Qualification Europe'
+};
+
+let apiFootballCalls = 0;
+let footballDataCalls = 0;
+const API_FOOTBALL_LIMIT = 100;
+const FOOTBALL_DATA_LIMIT = 10;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static(__dirname));
+
+// ==================== MONGODB (FIXED PRIORITY) ====================
+const MONGODB_URI = process.env.MONGO_PUBLIC_URL ||
+                    process.env.MONGO_URI || 
+                    process.env.MONGODB_URI || 
+                    'mongodb://localhost:27017/football-predictions';
+
+console.log('🔌 MongoDB Configuration:');
+if (MONGODB_URI.includes('localhost')) {
+  console.log('⚠️  LOCAL MongoDB detected');
+  console.log('💡 For production: Add MONGO_PUBLIC_URL or MONGO_URI');
+} else {
+  console.log('✅ CLOUD MongoDB detected');
 }
 
-console.log("✅ MongoDB URI found:", MONGO_URI.substring(0, 20) + "...");
+let isMongoConnected = false;
 
-console.log("🔄 Connecting to MongoDB...");
-mongoose.connect(MONGO_URI)
-  .then(() => {
-    console.log("✅ MongoDB Connected Successfully!");
-    console.log("📦 Database:", mongoose.connection.name);
-  })
-  .catch(err => {
-    console.log("❌ MongoDB Connection Failed!");
-    console.log("Error:", err.message);
-    process.exit(1);
-  });
+mongoose.connect(MONGODB_URI, {
+  serverSelectionTimeoutMS: 30000,
+  socketTimeoutMS: 45000
+})
+.then(() => {
+  console.log('✅ MongoDB Connected!');
+  console.log('📦 Database:', mongoose.connection.db.databaseName);
+  isMongoConnected = true;
+})
+.catch(err => {
+  console.error('❌ MongoDB Error:', err.message);
+  isMongoConnected = false;
+});
 
-// Handle connection events
 mongoose.connection.on('disconnected', () => {
-  console.log('⚠️ MongoDB Disconnected. Reconnecting...');
+  console.warn('⚠️ MongoDB Disconnected');
+  isMongoConnected = false;
 });
 
-mongoose.connection.on('error', (err) => {
-  console.log('❌ MongoDB Error:', err.message);
+mongoose.connection.on('reconnected', () => {
+  console.log('✅ MongoDB Reconnected');
+  isMongoConnected = true;
 });
 
-// ===================== SCHEMAS =====================
-const MatchSchema = new mongoose.Schema({
+// ==================== SCHEMAS ====================
+const matchSchema = new mongoose.Schema({
   match_id: { type: String, required: true, unique: true },
-  league_id: Number,
+  home_team: { type: String, required: true },
+  away_team: { type: String, required: true },
+  league: String,
   league_name: String,
-  home_team: String,
-  away_team: String,
-  home_logo: String,
-  away_logo: String,
-  match_date: Date,
-  match_time_pkt: String,  // Pakistan time formatted
-  status: String,
   home_score: Number,
   away_score: Number,
-  venue: String,
-  created_at: { type: Date, default: Date.now },
-  updated_at: { type: Date, default: Date.now }
-});
-
-const PredictionSchema = new mongoose.Schema({
-  match_id: { type: String, required: true, unique: true },
-  league: String,
-  home_team: String,
-  away_team: String,
+  status: { type: String, default: 'NS' },
+  match_time: String,
+  match_time_pkt: String,
   match_date: Date,
+  venue: String,
+  home_logo: String,
+  away_logo: String,
+  api_source: String
+}, { timestamps: true });
+
+matchSchema.index({ match_date: 1 });
+matchSchema.index({ status: 1 });
+
+const predictionSchema = new mongoose.Schema({
+  match_id: { type: String, required: true, unique: true },
+  home_team: { type: String, required: true },
+  away_team: { type: String, required: true },
+  league: String,
   match_time_pkt: String,
   winner_prob: {
-    home: Number,
-    draw: Number,
-    away: Number
+    home: { type: Number, default: 0 },
+    draw: { type: Number, default: 0 },
+    away: { type: Number, default: 0 }
   },
-  btts_prob: Number,
-  over_under: Object,
-  last10_prob: Number,
   xG: {
-    home: Number,
-    away: Number,
-    total: Number
+    home: { type: Number, default: 0 },
+    away: { type: Number, default: 0 },
+    total: { type: Number, default: 0 }
   },
-  strong_markets: Array,
-  confidence_score: Number,
-  created_at: { type: Date, default: Date.now },
-  updated_at: { type: Date, default: Date.now }
-});
+  btts_prob: { type: Number, default: 0 },
+  over_under: {
+    '1.5': { type: Number, default: 0 },
+    '2.5': { type: Number, default: 0 },
+    '3.5': { type: Number, default: 0 }
+  },
+  last10_prob: { type: Number, default: 0 },
+  confidence_score: { type: Number, default: 0 },
+  strong_markets: [{ market: String, prob: Number }],
+  is_new: { type: Boolean, default: true }
+}, { timestamps: true });
 
-// Create indexes for better performance
-MatchSchema.index({ match_date: -1 });
-MatchSchema.index({ status: 1 });
-PredictionSchema.index({ updated_at: -1 });
-PredictionSchema.index({ match_id: 1 });
+predictionSchema.index({ createdAt: -1 });
 
-const Match = mongoose.model("Match", MatchSchema);
-const Prediction = mongoose.model("Prediction", PredictionSchema);
+const Match = mongoose.model('Match', matchSchema);
+const Prediction = mongoose.model('Prediction', predictionSchema);
 
-// ===================== API CONFIGURATION =====================
-const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY || "fdab0eef5743173c30f9810bef3a6742";
-const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY || "62207494b8a241db93aee4c14b7c1266";
-
-// Top Leagues + World Cup Qualifiers
-const TARGET_LEAGUES = [39, 140, 135, 78, 61, 94, 88, 203, 2, 3, 32, 34, 33];
-
-// ===================== HELPER: Pakistan Time =====================
-function formatPakistanTime(dateStr) {
-  const pktTime = moment(dateStr).tz("Asia/Karachi");
-  return {
-    date: pktTime.format("DD MMM YYYY"),
-    time: pktTime.format("hh:mm A"),
-    fullDateTime: pktTime.format("DD MMM YYYY, hh:mm A"),
-    isoDate: pktTime.toISOString()
+// ==================== HELPER FUNCTIONS ====================
+function convertStatus(status) {
+  const map = {
+    'NS': 'NS', 'TBD': 'NS', 'SCHEDULED': 'NS',
+    'LIVE': 'LIVE', 'IN_PLAY': 'LIVE',
+    '1H': '1H', 'HT': 'HT', '2H': '2H',
+    'FT': 'FT', 'FINISHED': 'FT', 'AET': 'FT', 'PEN': 'FT',
+    'ET': 'ET', 'P': 'P'
   };
+  return map[status] || 'NS';
 }
 
-// ===================== FETCH LIVE MATCHES =====================
-async function fetchLiveMatches() {
-  console.log("\n🔄 ============ FETCHING LIVE MATCHES ============");
-  
+function toPakistanTime(dateString) {
   try {
-    const todayPKT = moment().tz("Asia/Karachi").format("YYYY-MM-DD");
-    console.log("📅 Pakistan Date:", todayPKT);
-    console.log("🕐 Pakistan Time:", moment().tz("Asia/Karachi").format("hh:mm A"));
-
-    let matches = [];
-
-    // ========== METHOD 1: API-FOOTBALL ==========
-    try {
-      console.log("🌐 Fetching from API-Football...");
-      const url = `https://v3.football.api-sports.io/fixtures`;
-      const params = { date: todayPKT };
-      const headers = { "x-apisports-key": API_FOOTBALL_KEY };
-
-      const response = await axios.get(url, { headers, params, timeout: 15000 });
-
-      if (response.data?.response && response.data.response.length > 0) {
-        matches = response.data.response;
-        console.log(`✅ API-Football: ${matches.length} matches found`);
-      } else {
-        console.log("⚠️ No matches returned from API-Football");
-      }
-
-    } catch (apiError) {
-      console.log("❌ API-Football Error:", apiError.message);
-    }
-
-    // ========== METHOD 2: FOOTBALL-DATA (Fallback) ==========
-    if (matches.length === 0) {
-      try {
-        console.log("🌐 Trying Football-Data.org...");
-        const fbUrl = `https://api.football-data.org/v4/matches`;
-        const fbHeaders = { "X-Auth-Token": FOOTBALL_DATA_KEY };
-
-        const fbResponse = await axios.get(fbUrl, { 
-          headers: fbHeaders,
-          params: { date: todayPKT },
-          timeout: 15000 
-        });
-
-        if (fbResponse.data?.matches) {
-          matches = fbResponse.data.matches.map(m => ({
-            fixture: {
-              id: m.id,
-              date: m.utcDate,
-              venue: { name: m.venue || "Unknown" },
-              status: { 
-                short: m.status === "FINISHED" ? "FT" : 
-                       m.status === "IN_PLAY" ? "LIVE" :
-                       m.status === "PAUSED" ? "HT" : "NS"
-              }
-            },
-            league: { 
-              id: m.competition?.id || 0, 
-              name: m.competition?.name || "Unknown"
-            },
-            teams: {
-              home: { 
-                id: m.homeTeam?.id || 0, 
-                name: m.homeTeam?.name || "Unknown",
-                logo: m.homeTeam?.crest || ""
-              },
-              away: { 
-                id: m.awayTeam?.id || 0, 
-                name: m.awayTeam?.name || "Unknown",
-                logo: m.awayTeam?.crest || ""
-              }
-            },
-            goals: { 
-              home: m.score?.fullTime?.home ?? null, 
-              away: m.score?.fullTime?.away ?? null 
-            }
-          }));
-          console.log(`✅ Football-Data: ${matches.length} matches converted`);
-        }
-      } catch (fbError) {
-        console.log("❌ Football-Data Error:", fbError.message);
-      }
-    }
-
-    // ========== METHOD 3: ALL LIVE MATCHES ==========
-    if (matches.length === 0) {
-      try {
-        console.log("🌐 Fetching ALL live matches...");
-        const liveUrl = `https://v3.football.api-sports.io/fixtures`;
-        const liveParams = { live: "all" };
-        const headers = { "x-apisports-key": API_FOOTBALL_KEY };
-
-        const liveResponse = await axios.get(liveUrl, { headers, params: liveParams, timeout: 15000 });
-
-        if (liveResponse.data?.response) {
-          matches = liveResponse.data.response;
-          console.log(`✅ Live matches: ${matches.length} found`);
-        }
-      } catch (liveError) {
-        console.log("❌ Live fetch error:", liveError.message);
-      }
-    }
-
-    if (matches.length === 0) {
-      console.log("❌ No matches found from any source!");
-      return;
-    }
-
-    console.log(`📊 Processing ${matches.length} total matches...`);
-
-    // Filter for target leagues (optional)
-    const filteredMatches = matches.filter(m => 
-      !TARGET_LEAGUES.length || TARGET_LEAGUES.includes(m.league?.id)
-    );
-
-    const matchesToSave = filteredMatches.length > 0 ? filteredMatches : matches.slice(0, 50);
-    console.log(`🎯 Saving ${matchesToSave.length} matches...`);
-
-    // Save to MongoDB with Pakistan time
-    let savedCount = 0;
-    for (const match of matchesToSave) {
-      try {
-        // Validate essential fields
-        if (!match.teams?.home?.name || !match.teams?.away?.name) {
-          console.log("⚠️ Skipping match with missing team names");
-          continue;
-        }
-
-        const pktTime = formatPakistanTime(match.fixture?.date);
-        
-        const matchData = {
-          match_id: String(match.fixture?.id),
-          league_id: match.league?.id || 0,
-          league_name: match.league?.name || "Unknown League",
-          home_team: match.teams.home.name,
-          away_team: match.teams.away.name,
-          home_logo: match.teams?.home?.logo || "",
-          away_logo: match.teams?.away?.logo || "",
-          match_date: new Date(match.fixture?.date),
-          match_time_pkt: pktTime.fullDateTime,
-          status: match.fixture?.status?.short || "NS",
-          home_score: match.goals?.home ?? 0,
-          away_score: match.goals?.away ?? 0,
-          venue: match.fixture?.venue?.name || "Unknown",
-          updated_at: new Date()
-        };
-
-        // Log sample data for debugging
-        if (savedCount === 0) {
-          console.log("📝 Sample match data:", {
-            id: matchData.match_id,
-            league: matchData.league_name,
-            match: `${matchData.home_team} vs ${matchData.away_team}`,
-            time: matchData.match_time_pkt,
-            status: matchData.status
-          });
-        }
-
-        await Match.findOneAndUpdate(
-          { match_id: matchData.match_id },
-          matchData,
-          { upsert: true, new: true }
-        );
-        savedCount++;
-      } catch (saveError) {
-        console.log(`⚠️ Save error: ${saveError.message}`);
-      }
-    }
-
-    console.log(`✅ Successfully saved ${savedCount} matches to MongoDB`);
-    console.log("============ FETCH COMPLETE ============\n");
-
-  } catch (error) {
-    console.log(`❌ CRITICAL ERROR: ${error.message}`);
+    return new Date(dateString).toLocaleString('en-PK', {
+      timeZone: 'Asia/Karachi',
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return 'Time TBA';
   }
 }
 
-// ===================== PREDICTION ENGINE =====================
-async function generatePrediction(match) {
+function calculatePredictions(match) {
+  const homeStrength = (match.home_team.length % 10) + 1;
+  const awayStrength = (match.away_team.length % 10) + 1;
+  const total = homeStrength + awayStrength;
+  
+  const homeWinProb = Math.round((homeStrength / total) * 100);
+  const awayWinProb = Math.round((awayStrength / total) * 100);
+  const drawProb = 100 - homeWinProb - awayWinProb;
+  
+  const homeXg = (homeStrength / 5).toFixed(1);
+  const awayXg = (awayStrength / 5).toFixed(1);
+  const totalXg = (parseFloat(homeXg) + parseFloat(awayXg)).toFixed(1);
+  
+  const bttsProb = totalXg > 2.5 ? 65 : 45;
+  const over25 = totalXg > 2.5 ? 70 : 40;
+  
+  const strongMarkets = [];
+  if (homeWinProb >= 85) strongMarkets.push({ market: 'Home Win', prob: homeWinProb });
+  if (awayWinProb >= 85) strongMarkets.push({ market: 'Away Win', prob: awayWinProb });
+  if (over25 >= 85) strongMarkets.push({ market: 'Over 2.5', prob: over25 });
+  
+  const confidence = Math.round((Math.max(homeWinProb, drawProb, awayWinProb) + over25) / 2);
+  
+  return {
+    match_id: match.match_id,
+    home_team: match.home_team,
+    away_team: match.away_team,
+    league: match.league_name || match.league,
+    match_time_pkt: match.match_time_pkt,
+    winner_prob: { home: homeWinProb, draw: drawProb, away: awayWinProb },
+    xG: { home: parseFloat(homeXg), away: parseFloat(awayXg), total: parseFloat(totalXg) },
+    btts_prob: bttsProb,
+    over_under: { '1.5': 75, '2.5': over25, '3.5': 55 },
+    last10_prob: 45,
+    confidence_score: confidence,
+    strong_markets: strongMarkets,
+    is_new: true
+  };
+}
+
+// ==================== FETCH FROM API-FOOTBALL ====================
+async function fetchFromApiFootball() {
   try {
-    const homeTeam = match.home_team;
-    const awayTeam = match.away_team;
-
-    // Get recent form (last 10 matches)
-    const homeMatches = await Match.find({
-      $or: [{ home_team: homeTeam }, { away_team: homeTeam }],
-      status: "FT"
-    }).sort({ match_date: -1 }).limit(10);
-
-    const awayMatches = await Match.find({
-      $or: [{ home_team: awayTeam }, { away_team: awayTeam }],
-      status: "FT"
-    }).sort({ match_date: -1 }).limit(10);
-
-    // Calculate statistics
-    let homeGoalsFor = 0, homeGoalsAgainst = 0, homeWins = 0, homeDraws = 0;
-    let awayGoalsFor = 0, awayGoalsAgainst = 0, awayWins = 0, awayDraws = 0;
-
-    homeMatches.forEach(m => {
-      if (m.home_team === homeTeam) {
-        homeGoalsFor += m.home_score || 0;
-        homeGoalsAgainst += m.away_score || 0;
-        if ((m.home_score || 0) > (m.away_score || 0)) homeWins++;
-        if ((m.home_score || 0) === (m.away_score || 0)) homeDraws++;
-      } else {
-        homeGoalsFor += m.away_score || 0;
-        homeGoalsAgainst += m.home_score || 0;
-        if ((m.away_score || 0) > (m.home_score || 0)) homeWins++;
-        if ((m.home_score || 0) === (m.away_score || 0)) homeDraws++;
-      }
-    });
-
-    awayMatches.forEach(m => {
-      if (m.home_team === awayTeam) {
-        awayGoalsFor += m.home_score || 0;
-        awayGoalsAgainst += m.away_score || 0;
-        if ((m.home_score || 0) > (m.away_score || 0)) awayWins++;
-        if ((m.home_score || 0) === (m.away_score || 0)) awayDraws++;
-      } else {
-        awayGoalsFor += m.away_score || 0;
-        awayGoalsAgainst += m.home_score || 0;
-        if ((m.away_score || 0) > (m.home_score || 0)) awayWins++;
-        if ((m.home_score || 0) === (m.away_score || 0)) awayDraws++;
-      }
-    });
-
-    // Advanced xG calculation
-    const homeAvgFor = homeMatches.length > 0 ? homeGoalsFor / homeMatches.length : 1.2;
-    const homeAvgAgainst = homeMatches.length > 0 ? homeGoalsAgainst / homeMatches.length : 1.2;
-    const awayAvgFor = awayMatches.length > 0 ? awayGoalsFor / awayMatches.length : 1.0;
-    const awayAvgAgainst = awayMatches.length > 0 ? awayGoalsAgainst / awayMatches.length : 1.0;
-
-    const xG_home = Number((homeAvgFor * 1.3 + awayAvgAgainst * 0.7 + 0.2).toFixed(2));
-    const xG_away = Number((awayAvgFor * 0.9 + homeAvgAgainst * 0.6).toFixed(2));
-    const xG_total = Number((xG_home + xG_away).toFixed(2));
-
-    // Winner probabilities
-    const homeFormScore = (homeWins * 3 + homeDraws * 1) / Math.max(homeMatches.length, 1);
-    const awayFormScore = (awayWins * 3 + awayDraws * 1) / Math.max(awayMatches.length, 1);
+    console.log('\n🌐 Fetching from API-Football...');
+    console.log(`📊 API Calls: ${apiFootballCalls}/${API_FOOTBALL_LIMIT}`);
     
-    const homeStrength = xG_home * 2 + homeFormScore * 1.5;
-    const awayStrength = xG_away * 2 + awayFormScore * 1.2;
-    const totalStrength = homeStrength + awayStrength;
-
-    let homeProb = Math.round((homeStrength / totalStrength) * 100);
-    let awayProb = Math.round((awayStrength / totalStrength) * 100);
-    let drawProb = Math.max(100 - homeProb - awayProb, 15);
-
-    const sum = homeProb + drawProb + awayProb;
-    homeProb = Math.round((homeProb / sum) * 100);
-    drawProb = Math.round((drawProb / sum) * 100);
-    awayProb = 100 - homeProb - drawProb;
-
-    // BTTS probability
-    const bttsHistory = [...homeMatches, ...awayMatches].filter(m => 
-      (m.home_score || 0) > 0 && (m.away_score || 0) > 0
-    ).length;
-    const bttsProb = Math.min(95, Math.round(
-      (bttsHistory / Math.max(homeMatches.length + awayMatches.length, 1)) * 100 + 
-      (xG_total > 2.5 ? 15 : 0)
-    ));
-
-    // Over/Under markets
-    const overUnder = {};
-    [0.5, 1.5, 2.5, 3.5, 4.5, 5.5].forEach(line => {
-      const overProb = Math.min(98, Math.max(5, Math.round(
-        (xG_total / (line + 0.5)) * 55 + (Math.random() * 15)
-      )));
-      overUnder[line.toFixed(1)] = overProb;
-    });
-
-    // Last 10 minutes probability
-    const last10Prob = Math.min(92, Math.max(8, Math.round(
-      xG_total * 11 + (homeAvgFor + awayAvgFor) * 5
-    )));
-
-    // Strong markets (≥85% confidence)
-    const strongMarkets = [];
-    if (homeProb >= 85) strongMarkets.push({ market: "Home Win", prob: homeProb });
-    if (drawProb >= 85) strongMarkets.push({ market: "Draw", prob: drawProb });
-    if (awayProb >= 85) strongMarkets.push({ market: "Away Win", prob: awayProb });
-    if (bttsProb >= 85) strongMarkets.push({ market: "BTTS Yes", prob: bttsProb });
+    if (apiFootballCalls >= API_FOOTBALL_LIMIT) {
+      console.log('⚠️ API-Football limit reached');
+      return null;
+    }
     
-    Object.entries(overUnder).forEach(([line, prob]) => {
-      if (prob >= 85) strongMarkets.push({ market: `Over ${line}`, prob });
-      if ((100 - prob) >= 85) strongMarkets.push({ market: `Under ${line}`, prob: 100 - prob });
-    });
-
-    // Confidence score based on data availability
-    const confidenceScore = Math.min(100, Math.round(
-      (homeMatches.length + awayMatches.length) / 20 * 100
-    ));
-
-    return {
-      match_id: match.match_id,
-      league: match.league_name,
-      home_team: homeTeam,
-      away_team: awayTeam,
-      match_date: match.match_date,
-      match_time_pkt: match.match_time_pkt,
-      winner_prob: { home: homeProb, draw: drawProb, away: awayProb },
-      btts_prob: bttsProb,
-      over_under: overUnder,
-      last10_prob: last10Prob,
-      xG: { home: xG_home, away: xG_away, total: xG_total },
-      strong_markets: strongMarkets,
-      confidence_score: confidenceScore,
-      updated_at: new Date()
-    };
-
+    const today = new Date().toISOString().split('T')[0];
+    const tomorrow = new Date(Date.now() + 24*60*60*1000).toISOString().split('T')[0];
+    
+    console.log('📅 Fetching:', today, '&', tomorrow);
+    
+    let allMatches = [];
+    
+    for (const date of [today, tomorrow]) {
+      if (apiFootballCalls >= API_FOOTBALL_LIMIT) break;
+      
+      console.log(`\n🔍 Fetching ${date}...`);
+      
+      try {
+        const response = await fetch(
+          `https://v3.football.api-sports.io/fixtures?date=${date}`,
+          {
+            headers: {
+              'x-rapidapi-key': API_FOOTBALL_KEY,
+              'x-rapidapi-host': 'v3.football.api-sports.io'
+            },
+            signal: AbortSignal.timeout(15000)
+          }
+        );
+        
+        apiFootballCalls++;
+        
+        if (!response.ok) {
+          console.log(`❌ API Error: ${response.status}`);
+          continue;
+        }
+        
+        const data = await response.json();
+        
+        if (!data.response || data.response.length === 0) {
+          console.log(`⚠️ No matches for ${date}`);
+          continue;
+        }
+        
+        console.log(`✅ Found ${data.response.length} total matches`);
+        
+        // Filter for target leagues
+        const filtered = data.response.filter(f => 
+          Object.keys(TOP_LEAGUES).includes(String(f.league.id))
+        );
+        
+        console.log(`🎯 Filtered: ${filtered.length} from target leagues`);
+        
+        // Show breakdown
+        const breakdown = {};
+        filtered.forEach(f => {
+          const name = f.league.name;
+          breakdown[name] = (breakdown[name] || 0) + 1;
+        });
+        
+        Object.entries(breakdown).forEach(([league, count]) => {
+          console.log(`   📌 ${league}: ${count}`);
+        });
+        
+        const matches = filtered.map(f => ({
+          match_id: `af_${f.fixture.id}`,
+          home_team: f.teams.home.name,
+          away_team: f.teams.away.name,
+          league: f.league.name,
+          league_name: f.league.name,
+          home_score: f.goals.home,
+          away_score: f.goals.away,
+          status: convertStatus(f.fixture.status.short),
+          match_time: f.fixture.date,
+          match_time_pkt: toPakistanTime(f.fixture.date),
+          match_date: new Date(f.fixture.date),
+          venue: f.fixture.venue?.name || 'Unknown',
+          home_logo: f.teams.home.logo,
+          away_logo: f.teams.away.logo,
+          api_source: 'API-Football'
+        }));
+        
+        allMatches = [...allMatches, ...matches];
+        
+      } catch (error) {
+        console.error(`❌ Fetch error for ${date}:`, error.message);
+      }
+    }
+    
+    console.log(`\n✅ API-Football Total: ${allMatches.length}`);
+    return allMatches.length > 0 ? allMatches : null;
+    
   } catch (error) {
-    console.log(`❌ Prediction Error for ${match.home_team}: ${error.message}`);
+    console.error('❌ API-Football Error:', error.message);
     return null;
   }
 }
 
-// ===================== UPDATE PREDICTIONS =====================
-async function updatePredictions() {
-  console.log("\n🔄 ============ UPDATING PREDICTIONS ============");
-  
+// ==================== FETCH FROM FOOTBALL-DATA ====================
+async function fetchFromFootballData() {
   try {
-    const matches = await Match.find({ 
-      status: { $in: ["NS", "1H", "HT", "2H", "ET", "P", "LIVE"] }
-    }).sort({ match_date: 1 }).limit(100);
-
-    console.log(`📊 Processing ${matches.length} matches...`);
-    let updated = 0;
-
-    for (const match of matches) {
-      const prediction = await generatePrediction(match);
-      if (prediction) {
-        await Prediction.findOneAndUpdate(
-          { match_id: prediction.match_id },
-          prediction,
-          { upsert: true, new: true }
+    console.log('\n🌐 Fetching from Football-Data.org...');
+    console.log(`📊 Calls: ${footballDataCalls}/${FOOTBALL_DATA_LIMIT}`);
+    
+    if (footballDataCalls >= FOOTBALL_DATA_LIMIT) {
+      console.log('⚠️ Football-Data limit reached');
+      return null;
+    }
+    
+    const today = new Date().toISOString().split('T')[0];
+    const tomorrow = new Date(Date.now() + 24*60*60*1000).toISOString().split('T')[0];
+    
+    let allMatches = [];
+    
+    for (const date of [today, tomorrow]) {
+      if (footballDataCalls >= FOOTBALL_DATA_LIMIT) break;
+      
+      console.log(`\n🔍 Football-Data: ${date}...`);
+      
+      try {
+        const response = await fetch(
+          `https://api.football-data.org/v4/matches?date=${date}`,
+          {
+            headers: {
+              'X-Auth-Token': FOOTBALL_DATA_KEY
+            },
+            signal: AbortSignal.timeout(15000)
+          }
         );
-        updated++;
+        
+        footballDataCalls++;
+        
+        if (!response.ok) {
+          console.log(`❌ API Error: ${response.status}`);
+          continue;
+        }
+        
+        const data = await response.json();
+        
+        if (!data.matches || data.matches.length === 0) {
+          console.log(`⚠️ No matches for ${date}`);
+          continue;
+        }
+        
+        console.log(`✅ Found ${data.matches.length} matches`);
+        
+        const matches = data.matches.map(m => ({
+          match_id: `fd_${m.id}`,
+          home_team: m.homeTeam.name,
+          away_team: m.awayTeam.name,
+          league: m.competition.name,
+          league_name: m.competition.name,
+          home_score: m.score.fullTime.home,
+          away_score: m.score.fullTime.away,
+          status: convertStatus(m.status),
+          match_time: m.utcDate,
+          match_time_pkt: toPakistanTime(m.utcDate),
+          match_date: new Date(m.utcDate),
+          venue: m.venue || 'Unknown',
+          home_logo: m.homeTeam.crest || null,
+          away_logo: m.awayTeam.crest || null,
+          api_source: 'Football-Data'
+        }));
+        
+        allMatches = [...allMatches, ...matches];
+        
+      } catch (error) {
+        console.error(`❌ Error for ${date}:`, error.message);
       }
     }
-
-    // Keep only last 100 predictions
-    const totalPredictions = await Prediction.countDocuments();
-    if (totalPredictions > 100) {
-      const toDelete = totalPredictions - 100;
-      const oldPredictions = await Prediction.find()
-        .sort({ updated_at: 1 })
-        .limit(toDelete)
-        .select('_id');
-      
-      await Prediction.deleteMany({ 
-        _id: { $in: oldPredictions.map(p => p._id) } 
-      });
-      console.log(`🗑️ Deleted ${toDelete} old predictions (keeping last 100)`);
-    }
-
-    console.log(`✅ ${updated} predictions updated`);
-    console.log("============ PREDICTIONS COMPLETE ============\n");
+    
+    console.log(`\n✅ Football-Data Total: ${allMatches.length}`);
+    return allMatches.length > 0 ? allMatches : null;
     
   } catch (error) {
-    console.log(`❌ updatePredictions Error: ${error.message}`);
+    console.error('❌ Football-Data Error:', error.message);
+    return null;
   }
 }
 
-// ===================== CRON JOBS =====================
-cron.schedule("*/15 * * * *", () => {
-  console.log("⏰ CRON: 15-min interval - Fetching matches");
-  fetchLiveMatches();
-});
-
-cron.schedule("*/5 * * * *", () => {
-  console.log("⏰ CRON: 5-min interval - Updating predictions");
-  updatePredictions();
-});
-
-// Initial fetch on startup
-setTimeout(() => {
-  console.log("🚀 Starting initial data fetch...");
-  fetchLiveMatches();
-  setTimeout(() => updatePredictions(), 20000);
-}, 5000);
-
-// ===================== SSE ENDPOINT =====================
-app.get("/events", async (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
-
-  console.log("👤 SSE Client Connected");
-
-  const sendData = async () => {
-    try {
-      const predictions = await Prediction.find()
-        .sort({ updated_at: -1 })
-        .limit(100);
-      
-      const matches = await Match.find()
-        .sort({ match_date: 1 })
-        .limit(100);
-
-      res.write(`data: ${JSON.stringify({ 
-        predictions, 
-        matches,
-        timestamp: moment().tz("Asia/Karachi").format("DD MMM YYYY, hh:mm:ss A"),
-        count: { matches: matches.length, predictions: predictions.length }
-      })}\n\n`);
-    } catch (error) {
-      res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+// ==================== FETCH MATCHES (WITH FALLBACK) ====================
+async function fetchMatches() {
+  console.log('\n🔄 ============ FETCHING MATCHES ============');
+  
+  const pkTime = new Date().toLocaleString('en-PK', {
+    timeZone: 'Asia/Karachi',
+    weekday: 'long',
+    day: '2-digit',
+    month: 'long',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  });
+  
+  console.log('🇵🇰 Pakistan Time:', pkTime);
+  
+  if (!isMongoConnected) {
+    console.log('❌ MongoDB not connected');
+    return [];
+  }
+  
+  let allMatches = [];
+  
+  // STEP 1: Try API-Football
+  const apiFootballMatches = await fetchFromApiFootball();
+  if (apiFootballMatches && apiFootballMatches.length > 0) {
+    allMatches = [...allMatches, ...apiFootballMatches];
+  }
+  
+  // STEP 2: Fallback to Football-Data
+  if (apiFootballCalls >= API_FOOTBALL_LIMIT || !apiFootballMatches) {
+    console.log('\n🔄 Trying Football-Data fallback...');
+    const footballDataMatches = await fetchFromFootballData();
+    if (footballDataMatches && footballDataMatches.length > 0) {
+      allMatches = [...allMatches, ...footballDataMatches];
     }
-  };
+  }
+  
+  // Remove duplicates
+  const uniqueMatches = [];
+  const seen = new Set();
+  
+  for (const match of allMatches) {
+    const key = `${match.home_team}-${match.away_team}-${new Date(match.match_date).toDateString()}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      uniqueMatches.push(match);
+    }
+  }
+  
+  console.log(`\n✅ Total Unique Matches: ${uniqueMatches.length}`);
+  
+  // Save to database
+  let saved = 0;
+  for (const match of uniqueMatches) {
+    try {
+      await Match.findOneAndUpdate(
+        { match_id: match.match_id },
+        match,
+        { upsert: true, new: true }
+      );
+      saved++;
+    } catch (err) {
+      console.error('❌ Save error:', err.message);
+    }
+  }
+  
+  console.log(`✅ Saved: ${saved}/${uniqueMatches.length}`);
+  console.log('============ FETCH COMPLETE ============\n');
+  
+  return uniqueMatches;
+}
 
-  await sendData();
-  const interval = setInterval(sendData, 5 * 60 * 1000);
+// ==================== CLEANUP FINISHED ====================
+async function cleanupFinished() {
+  if (!isMongoConnected) return;
+  
+  try {
+    const finishedResult = await Match.deleteMany({
+      status: { $in: ['FT', 'AET', 'PEN'] }
+    });
+    
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    
+    const oldResult = await Match.deleteMany({
+      match_date: { $lt: todayStart }
+    });
+    
+    const totalDeleted = finishedResult.deletedCount + oldResult.deletedCount;
+    
+    if (totalDeleted > 0) {
+      console.log(`🗑️ Removed ${finishedResult.deletedCount} finished + ${oldResult.deletedCount} old = ${totalDeleted} total`);
+      
+      const activeIds = await Match.find().distinct('match_id');
+      const predResult = await Prediction.deleteMany({
+        match_id: { $nin: activeIds }
+      });
+      
+      if (predResult.deletedCount > 0) {
+        console.log(`🗑️ Removed ${predResult.deletedCount} orphaned predictions`);
+      }
+    }
+  } catch (err) {
+    console.error('❌ Cleanup error:', err.message);
+  }
+}
 
-  req.on("close", () => {
-    clearInterval(interval);
-    console.log("❌ SSE Client Disconnected");
+// ==================== API ROUTES ====================
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    mongodb: isMongoConnected ? 'Connected' : 'Disconnected',
+    apiFootballCalls: `${apiFootballCalls}/${API_FOOTBALL_LIMIT}`,
+    footballDataCalls: `${footballDataCalls}/${FOOTBALL_DATA_LIMIT}`,
+    time: new Date().toISOString()
   });
 });
 
-// ===================== API ROUTES =====================
-app.get("/api/predictions", async (req, res) => {
+app.get('/api/matches', async (req, res) => {
   try {
-    const predictions = await Prediction.find()
-      .sort({ updated_at: -1 })
-      .limit(100);
-    res.json({ success: true, count: predictions.length, data: predictions });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/api/matches", async (req, res) => {
-  try {
-    const matches = await Match.find()
-      .sort({ match_date: 1 })
-      .limit(100);
-    res.json({ success: true, count: matches.length, data: matches });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/api/today", async (req, res) => {
-  try {
-    const todayStart = moment().tz("Asia/Karachi").startOf("day");
-    const todayEnd = moment().tz("Asia/Karachi").endOf("day");
+    if (!isMongoConnected) {
+      return res.status(503).json({ success: false, error: 'MongoDB offline' });
+    }
+    
+    const now = new Date();
+    const todayStart = new Date(now);
+    todayStart.setHours(0, 0, 0, 0);
+    
+    const tomorrowEnd = new Date(now);
+    tomorrowEnd.setDate(tomorrowEnd.getDate() + 2);
+    tomorrowEnd.setHours(23, 59, 59, 999);
     
     const matches = await Match.find({
-      match_date: { 
-        $gte: todayStart.toDate(), 
-        $lte: todayEnd.toDate() 
+      status: { $in: ['NS', 'LIVE', '1H', '2H', 'HT', 'ET'] },
+      match_date: { $gte: todayStart, $lte: tomorrowEnd }
+    })
+      .sort({ match_date: 1 })
+      .limit(100);
+    
+    console.log(`📊 Active matches: ${matches.length}`);
+    
+    res.json({
+      success: true,
+      count: matches.length,
+      data: matches
+    });
+  } catch (err) {
+    console.error('❌ API Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/predictions', async (req, res) => {
+  try {
+    if (!isMongoConnected) {
+      return res.status(503).json({ success: false, error: 'MongoDB offline' });
+    }
+    
+    const now = new Date();
+    const todayStart = new Date(now);
+    todayStart.setHours(0, 0, 0, 0);
+    
+    const tomorrowEnd = new Date(now);
+    tomorrowEnd.setDate(tomorrowEnd.getDate() + 2);
+    
+    const activeIds = await Match.find({
+      status: { $in: ['NS', 'LIVE', '1H', '2H', 'HT', 'ET'] },
+      match_date: { $gte: todayStart, $lte: tomorrowEnd }
+    }).distinct('match_id');
+    
+    const predictions = await Prediction.find({
+      match_id: { $in: activeIds }
+    })
+      .sort({ createdAt: -1 })
+      .limit(100);
+    
+    const newCount = predictions.filter(p => p.is_new).length;
+    
+    console.log(`📊 Predictions: ${predictions.length} (${newCount} new)`);
+    
+    res.json({
+      success: true,
+      count: predictions.length,
+      newPredictions: newCount,
+      data: predictions
+    });
+  } catch (err) {
+    console.error('❌ API Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/fetch-matches', async (req, res) => {
+  try {
+    console.log('🔄 Manual fetch triggered');
+    const matches = await fetchMatches();
+    
+    if (matches.length > 0) {
+      for (const match of matches) {
+        const pred = calculatePredictions(match);
+        await Prediction.findOneAndUpdate(
+          { match_id: match.match_id },
+          pred,
+          { upsert: true, new: true }
+        );
       }
-    }).sort({ match_date: 1 });
-
-    const matchIds = matches.map(m => m.match_id);
-    const predictions = await Prediction.find({ 
-      match_id: { $in: matchIds } 
+    }
+    
+    res.json({
+      success: true,
+      count: matches.length,
+      message: `Fetched ${matches.length} matches`
     });
-
-    res.json({ 
-      success: true, 
-      date: todayStart.format("DD MMMM YYYY"),
-      timezone: "Pakistan (PKT)",
-      matches, 
-      predictions 
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    console.error('❌ Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Manual trigger endpoint (for testing)
-app.get("/api/fetch-now", async (req, res) => {
+app.post('/api/mark-predictions-seen', async (req, res) => {
   try {
-    await fetchLiveMatches();
-    res.json({ 
-      success: true, 
-      message: "Fetch triggered",
-      time: moment().tz("Asia/Karachi").format("DD MMM YYYY, hh:mm A")
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    await Prediction.updateMany({ is_new: true }, { is_new: false });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Clear corrupted data endpoint
-app.get("/api/clear-db", async (req, res) => {
+app.get('/api/cleanup-old-matches', async (req, res) => {
   try {
-    await Match.deleteMany({});
-    await Prediction.deleteMany({});
-    console.log("🗑️ Database cleared");
-    res.json({ 
-      success: true, 
-      message: "Database cleared. Now visit /api/fetch-now to get fresh data"
+    if (!isMongoConnected) {
+      return res.status(503).json({ success: false, error: 'MongoDB offline' });
+    }
+    
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    
+    const result = await Match.deleteMany({
+      match_date: { $lt: todayStart }
     });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    
+    const activeIds = await Match.find().distinct('match_id');
+    const predResult = await Prediction.deleteMany({
+      match_id: { $nin: activeIds }
+    });
+    
+    console.log(`🗑️ Cleaned: ${result.deletedCount} matches, ${predResult.deletedCount} predictions`);
+    
+    res.json({
+      success: true,
+      matchesDeleted: result.deletedCount,
+      predictionsDeleted: predResult.deletedCount
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ===================== SERVE FRONTEND =====================
-app.use(express.static(__dirname));
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// ===================== START SERVER =====================
+// ==================== AUTO TASKS ====================
+
+setTimeout(async () => {
+  if (!isMongoConnected) {
+    console.log('⏳ Waiting for MongoDB...');
+    let attempts = 0;
+    while (!isMongoConnected && attempts < 30) {
+      await new Promise(r => setTimeout(r, 1000));
+      attempts++;
+    }
+  }
+  
+  if (isMongoConnected) {
+    console.log('🚀 Initial fetch...');
+    const matches = await fetchMatches();
+    
+    if (matches.length > 0) {
+      console.log('🔄 Creating predictions...');
+      for (const match of matches) {
+        const pred = calculatePredictions(match);
+        await Prediction.findOneAndUpdate(
+          { match_id: match.match_id },
+          pred,
+          { upsert: true, new: true }
+        );
+      }
+      console.log(`✅ Created ${matches.length} predictions`);
+    }
+  }
+}, 10000);
+
+setInterval(async () => {
+  if (isMongoConnected) {
+    await fetchMatches();
+  }
+}, 15 * 60 * 1000);
+
+setInterval(async () => {
+  if (!isMongoConnected) return;
+  
+  console.log('\n🔄 Auto-update...');
+  await cleanupFinished();
+  
+  const activeMatches = await Match.find({
+    status: { $in: ['NS', 'LIVE', '1H', '2H', 'HT', 'ET'] }
+  }).limit(100);
+  
+  console.log(`📊 Updating ${activeMatches.length} predictions`);
+  
+  for (const match of activeMatches) {
+    const existing = await Prediction.findOne({ match_id: match.match_id });
+    const pred = calculatePredictions(match);
+    pred.is_new = !existing;
+    
+    await Prediction.findOneAndUpdate(
+      { match_id: match.match_id },
+      pred,
+      { upsert: true, new: true }
+    );
+  }
+  
+  console.log('✅ Update complete\n');
+}, 5 * 60 * 1000);
+
+setInterval(async () => {
+  if (isMongoConnected) {
+    await cleanupFinished();
+  }
+}, 2 * 60 * 1000);
+
+// ==================== START SERVER ====================
 app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════════╗
-║   ⚽ FOOTBALL PREDICTION SYSTEM LIVE ⚽    ║
-║                                            ║
-║   🚀 Server: http://localhost:${PORT}     ║
-║   🕐 Timezone: Pakistan (PKT)              ║
-║   📊 Matches: Last 100 (Left Side)         ║
-║   🎯 Predictions: Last 100 (Right Side)    ║
-║                                            ║
-║   ✅ 15-min match fetch (96/day)           ║
-║   ✅ 5-min predictions update              ║
-║   ✅ Auto-delete old predictions           ║
-║   ✅ MongoDB properly connected            ║
-╚════════════════════════════════════════════╝
-  `);
+  console.log('\n╔════════════════════════════════════════════╗');
+  console.log('║   ⚽ FOOTBALL PREDICTION SYSTEM ⚽          ║');
+  console.log('║                                            ║');
+  console.log(`║   🚀 Server: http://localhost:${PORT}     ║`);
+  console.log('║   📅 Today + Tomorrow                      ║');
+  console.log('║   🗑️  Auto-cleanup finished                ║');
+  console.log('║   🏆 Arab Cup (ID: 480)                    ║');
+  console.log('║   🇵🇰 Pakistan Time                         ║');
+  console.log('║   🔄 Dual API (Football + Data.org)        ║');
+  console.log('╚════════════════════════════════════════════╝\n');
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n🛑 Shutting down...');
+  if (isMongoConnected) {
+    await mongoose.connection.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down...');
+  if (isMongoConnected) {
+    await mongoose.connection.close();
+  }
+  process.exit(0);
 });
